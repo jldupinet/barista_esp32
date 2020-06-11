@@ -1,3 +1,21 @@
+#include <WiFi.h>
+#include <time.h>
+
+const char* ssid = "Plus";
+const char* password = "........";
+
+
+const char* NTP_SERVER = "pool.ntp.org";
+const char* TZ_INFO    = "CST6CDT,M4.1.0,M10.5.0";  // enter your time zone (https://remotemonitoringsystems.ca/time-zone-abbreviations.php)
+
+tm timeinfo;
+time_t now;
+long unsigned lastNTPtime;
+unsigned long lastEntryTime;
+
+long unsigned lastWakeTime = 0;
+long lastUpdateTime = 0;
+
 /* BLE Libs */
 #include <BLEDevice.h>
 #include <BLEServer.h>
@@ -31,7 +49,7 @@ uint8_t txValue = 0;
 #define CHARACTERISTIC_UUID_RX "6E400002-B5A3-F393-E0A9-E50E24DCCA9E" // RX Characteristic
 #define CHARACTERISTIC_UUID_TX "6E400003-B5A3-F393-E0A9-E50E24DCCA9E" // TX Characteristic
 
-//#define LED 2
+#define LED 2
 
 #define SHOT_BUTTON 26 // Pin to control shot button via relay
 #define POWER_BUTTON 27 // Pin to control power button via relay
@@ -88,7 +106,26 @@ void setup() {
   
   // Configure machine buttons controlled via relay (ground triggered)
   pinMode(SHOT_BUTTON, OUTPUT);
+  pinMode(LED, OUTPUT);
   digitalWrite(SHOT_BUTTON, HIGH);
+
+    WiFi.begin(ssid, password);
+
+  int counter = 0;
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(200);
+    if (++counter > 100) ESP.restart();
+    Serial.print ( "." );
+  }
+  Serial.println("\n\nWiFi connected\n\n");
+  digitalWrite(LED, HIGH);
+  delay(200);
+  digitalWrite(LED, LOW);
+  delay(200);
+  digitalWrite(LED, HIGH);
+  delay(200);
+  digitalWrite(LED, LOW);
+
 
   // Create the BLE Device
   BLEDevice::init("UART Service");
@@ -125,6 +162,8 @@ void setup() {
   Serial.println("Wait...");
   initScale();
   Serial.println("Setup Completed!");
+
+
 }
 
 void initScale(){
@@ -134,15 +173,105 @@ void initScale(){
   LoadCell.setCalFactor(WEIGHT_SCALE_FACTOR); // user set calibration factor (float)
 }
 
+bool getNTPtime(int sec) {
+
+  {
+    uint32_t start = millis();
+    do {
+      time(&now);
+      localtime_r(&now, &timeinfo);
+      Serial.print(".");
+      delay(10);
+    } while (((millis() - start) <= (1000 * sec)) && (timeinfo.tm_year < (2016 - 1900)));
+    if (timeinfo.tm_year <= (2016 - 1900)) return false;  // the NTP call was not successful
+    //Serial.print("now ");  Serial.println(now);
+    char time_output[30];
+    strftime(time_output, 30, "%a  %d-%m-%y %T", localtime(&now));
+    Serial.println(time_output);
+    Serial.println();
+  }
+  return true;
+}
+
+void updateClock(){
+
+    //Serial.printf("Connecting to %s ", ssid);
+
+      //init and get the time
+    configTime(0, 0, NTP_SERVER);
+    setenv("TZ", TZ_INFO, 1);
+    
+    if (getNTPtime(10)) {  // wait up to 10sec to sync
+    } else {
+      Serial.println("Time not set");
+      ESP.restart();
+    }
+//    showTime(timeinfo);
+    autoWakeUp(timeinfo);
+    lastNTPtime = time(&now);
+    lastEntryTime = millis();
+//    //disconnect WiFi as it's no longer needed
+//    WiFi.disconnect(true);
+//    WiFi.mode(WIFI_OFF);
+    
+  
+}
+
+void showTime(tm localTime) {
+  Serial.print(localTime.tm_mday);
+  Serial.print('/');
+  Serial.print(localTime.tm_mon + 1);
+  Serial.print('/');
+  Serial.print(localTime.tm_year - 100);
+  Serial.print('-');
+  Serial.print(localTime.tm_hour);
+  Serial.print(':');
+  Serial.print(localTime.tm_min);
+  Serial.print(':');
+  Serial.print(localTime.tm_sec);
+  Serial.print(" Day of Week ");
+  if (localTime.tm_wday == 0)   Serial.println(7);
+  else Serial.println(localTime.tm_wday);
+}
+
+
+void autoWakeUp(tm localTime){
+  if((now - lastWakeTime) < (61)){
+    Serial.println("Too recent");
+    pTxCharacteristic->setValue("Too recent");
+    pTxCharacteristic->notify();
+    return;
+  }
+  //Serial.println(&localTime, "%A, %B %d %Y %H:%M:%S");
+  if(localTime.tm_hour == 20 && localTime.tm_min % 2 == 0){
+    Serial.println("Turning ON");
+    pTxCharacteristic->setValue("Turning ON");
+    pTxCharacteristic->notify();
+    digitalWrite(POWER_BUTTON, LOW);
+    delay(200);
+    digitalWrite(POWER_BUTTON, HIGH);
+    lastWakeTime = now;
+  } else {
+    Serial.println("Not Time Yet");
+    pTxCharacteristic->setValue("Not Time Yet");
+    pTxCharacteristic->notify();
+  }
+}
+
 void loop() {
 
   //update() should be called at least as often as HX711 sample rate; >10Hz@10SPS, >80Hz@80SPS
   //longer delay in sketch will reduce effective sample rate (be carefull with delay() in loop)
 
   if (deviceConnected) {
+    digitalWrite(LED, HIGH);
     if (currentExtraction.shouldExtract) {
       extract();
     }
+  } else {
+    //update time
+    updateClock();
+    delay(1000);
   }
 
   // disconnecting
@@ -151,11 +280,15 @@ void loop() {
     pServer->startAdvertising(); // restart advertising
     Serial.println("start advertising");
     oldDeviceConnected = deviceConnected;
+    digitalWrite(LED, LOW);
+
   }
   // connecting
   if (deviceConnected && !oldDeviceConnected) {
     oldDeviceConnected = deviceConnected;
   }
+
+  //autoWakeUp();
 }
 
 /*
@@ -189,6 +322,16 @@ float getWeight() {
 
   weight = fabs(LoadCell.getData());
   t = millis();
+  // do some basic filtering to remove outliers
+  if(weight < 1){ // remove very little weights (noise)
+    return 0;
+  }
+  if(weight > 100){ // we know we will never weight more than 100g of espresso
+    return currentExtraction.currentWeight;
+  }
+  if(weight < currentExtraction.currentWeight){ // very likely a measurement error
+    return currentExtraction.currentWeight;
+  }
   return weight;
 }
 
